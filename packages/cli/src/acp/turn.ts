@@ -48,6 +48,9 @@ export const CancelDrainTimeout = Context.Reference<Duration.Input>("@opencode/c
   defaultValue: () => "5 seconds",
 })
 
+/** A command may return before its admitted prompt reaches the event stream. */
+const CommandStartGrace = Duration.millis(500)
+
 type Subscription = {
   readonly scope: Scope.Closeable
   readonly events: Queue.Dequeue<OpenCodeEvent, unknown>
@@ -60,6 +63,9 @@ type Turn = {
   readonly state: Ref.Ref<ACPTranslate.TurnState>
   readonly subscription: Subscription
   readonly cancelled: Deferred.Deferred<void>
+  readonly commandFinished: Deferred.Deferred<void>
+  readonly commandStarted: Deferred.Deferred<void>
+  readonly commandTerminal: Ref.Ref<ACPTranslate.Terminal | undefined>
   readonly background: boolean
 }
 
@@ -93,7 +99,16 @@ export const make = Effect.fnUntraced(function* (input: {
       Effect.forever,
       Effect.forkIn(subscriptionScope),
     )
-    return { ctx, state, subscription, cancelled: yield* Deferred.make<void>(), background: false } satisfies Turn
+    return {
+      ctx,
+      state,
+      subscription,
+      cancelled: yield* Deferred.make<void>(),
+      commandFinished: yield* Deferred.make<void>(),
+      commandStarted: yield* Deferred.make<void>(),
+      commandTerminal: yield* Ref.make<ACPTranslate.Terminal | undefined>(undefined),
+      background: false,
+    } satisfies Turn
   })
 
   const take = (subscription: Subscription) =>
@@ -210,6 +225,12 @@ export const make = Effect.fnUntraced(function* (input: {
       return [next, next.state]
     })
     yield* Effect.forEach(folded.outputs, (output) => interpret(turn, output), { discard: true })
+    if (turn.ctx.command && event.type === "session.execution.started") {
+      yield* Deferred.succeed(turn.commandStarted, undefined)
+    }
+    if (turn.ctx.command && folded.terminal) {
+      yield* Ref.set(turn.commandTerminal, folded.terminal)
+    }
     return folded
   })
 
@@ -217,6 +238,14 @@ export const make = Effect.fnUntraced(function* (input: {
     while (true) {
       const folded = yield* advance(turn)
       if (folded.terminal) {
+        // A registered executor can own several execution cycles. Its return,
+        // rather than the first terminal event, ends command-owned streaming.
+        if (
+          turn.ctx.command &&
+          !(yield* Deferred.isDone(turn.commandFinished)) &&
+          !(yield* Deferred.isDone(turn.cancelled))
+        )
+          continue
         yield* asksSettled(turn.subscription)
         return folded.terminal
       }
@@ -299,7 +328,20 @@ export const make = Effect.fnUntraced(function* (input: {
       const events = yield* consume(turn).pipe(Effect.forkScoped)
       return yield* Effect.gen(function* () {
         yield* submit(attached, prompt)
-        if (prompt.command) return "succeeded" as const
+        if (prompt.command) {
+          yield* Deferred.succeed(turn.commandFinished, undefined)
+          const terminal = yield* Ref.get(turn.commandTerminal)
+          if (terminal !== undefined && (yield* Deferred.isDone(turn.commandStarted))) {
+            yield* asksSettled(turn.subscription)
+            return terminal
+          }
+          const started = yield* Deferred.await(turn.commandStarted).pipe(
+            Effect.timeoutOption(CommandStartGrace),
+          )
+          if (Option.isSome(started)) return yield* Fiber.join(events)
+          yield* asksSettled(turn.subscription)
+          return (yield* Ref.get(turn.commandTerminal)) ?? "succeeded"
+        }
         return yield* Fiber.join(events)
       }).pipe(Effect.onInterrupt(() => windDown(turn, events)))
     }).pipe(Effect.scoped)
@@ -372,6 +414,7 @@ export const make = Effect.fnUntraced(function* (input: {
           sessionID: attached.id,
           cwd: attached.cwd,
           start: prompt.start,
+          command: prompt.command !== undefined,
           childUpdates: capabilities.childSessionUpdates,
           compaction: capabilities.compaction,
         },
