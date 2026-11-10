@@ -26,6 +26,7 @@ export type TurnContext = {
   readonly sessionID: Session.ID
   readonly cwd: string
   readonly start: TurnStart
+  readonly command?: boolean
   readonly childUpdates: boolean
   readonly compaction: boolean
 }
@@ -46,6 +47,7 @@ type RetryStatus = {
 
 export type TurnState = {
   readonly started: boolean
+  readonly commandInbox?: string
   readonly tools: ReadonlyMap<string, Tool>
   readonly retries: ReadonlyMap<string, RetryStatus>
   readonly compactions: ACPCompaction.Tracked
@@ -123,8 +125,12 @@ export function fold(state: TurnState, event: OpenCodeEvent, ctx: TurnContext): 
     return { state: { ...state, asks }, outputs: [{ _tag: "AskSettled", id: settledID }] }
   }
   if (!sessionID || (sessionID !== ctx.sessionID && !child)) return { state, outputs: [] }
-  if (event.type === "session.inbox.delivered" && event.data.inboxID === ctx.start.id)
-    return { state: { ...state, started: true }, outputs: [] }
+  if (event.type === "session.inbox.delivered") {
+    if (event.data.inboxID === ctx.start.id) return { state: { ...state, started: true }, outputs: [] }
+    // A command admits its expanded prompt under a new inbox id. The first one is the command's.
+    if (ctx.command && state.commandInbox === undefined)
+      return { state: { ...state, started: true, commandInbox: event.data.inboxID }, outputs: [] }
+  }
   if (!state.started) return { state, outputs: [] }
   return child ? childEvent(state, event, ctx, child) : rootEvent(state, event, ctx)
 }
