@@ -2,12 +2,12 @@ import { app } from "electron"
 import type { Endpoint } from "@opencode/client/service"
 import { Context, Effect, FileSystem, Layer, Option, Path, Schema } from "effect"
 import { SidecarChanged } from "../../shared/ipc-rpc/events"
-import { CHANNEL } from "../constants"
+import { CHANNEL, serviceChannel } from "../constants"
 import { emitIpcEvent } from "../ipc-events"
 import { getMainWindows } from "../windows"
 import { BackgroundServiceMachine } from "./background-service-machine"
 import { cleanStages } from "./cli-stages"
-import { keptStages, serviceVersion, shouldRetryEnsure } from "./cli-version"
+import { stageRetention, serviceVersion, shouldRetryEnsure } from "./cli-version"
 import { DesktopCli } from "./desktop-cli"
 import { SidecarCredentials } from "./sidecar-credentials"
 import { takeSidecarProbe } from "./sidecar-probe"
@@ -46,10 +46,10 @@ export const layer = Layer.effect(
 // A compatible service the entry module already found is adopted at once; the machine still verifies it with
 // `ensure("initial")` (which also completes a terminal handoff), off the renderer's path.
 const probe = Effect.fn("BackgroundService.probe")(function* () {
-  const service = yield* Effect.promise(takeSidecarProbe)
+  const setup = yield* prepare("initial")
+  const service = yield* Effect.promise(() => takeSidecarProbe(setup.file))
 
   if (!service) return undefined
-  const setup = yield* prepare("initial")
 
   return (yield* adopt(setup, service, true)).credentials
 })
@@ -89,7 +89,7 @@ const ensure = Effect.fn("BackgroundService.ensure")(function* (mode: Background
   // once `Service.ensure` settled which server runs, never for a probed one it may still replace.
   if (mode === "initial" && (app.isPackaged || setup.isolated) && setup.cli.binary && ready.runningVersion)
     runFork(
-      cleanStages(setup.cli.binary, { keep: keptStages(setup.cli.version, ready.runningVersion) }).pipe(
+      cleanStages(setup.cli.binary, stageRetention(ready.runningVersion)).pipe(
         Effect.catch((error) => Effect.logError("failed to clean staged v2 CLIs", { error })),
       ),
     )
@@ -99,7 +99,6 @@ const ensure = Effect.fn("BackgroundService.ensure")(function* (mode: Background
 
 const prepare = Effect.fn("BackgroundService.prepare")(function* (mode: BackgroundServiceMachine.ConnectMode) {
   yield* Effect.logInfo("starting v2 background service")
-  const path = yield* Path.Path
   const desktopCli = yield* DesktopCli.Service
   const isolated = !app.isPackaged && process.env.OPENCODE_DESKTOP_ISOLATED_SERVER === "1"
   const cli = yield* desktopCli.resolve
@@ -108,14 +107,7 @@ const prepare = Effect.fn("BackgroundService.prepare")(function* (mode: Backgrou
   if (isolated) process.env.XDG_STATE_HOME = app.getPath("userData")
   const client = yield* Effect.promise(() => import("@opencode/client/service"))
 
-  const file =
-    process.env.OPENCODE_DESKTOP_SERVER_CHANNEL === "local"
-      ? path.join(
-          process.env.XDG_STATE_HOME ?? path.join(app.getPath("home"), ".local", "state"),
-          "opencode",
-          "service-local.json",
-        )
-      : undefined
+  const file = client.fallback(serviceChannel())
 
   return { cli, client, file, isolated, version }
 })
@@ -132,7 +124,7 @@ const adopt = Effect.fn("BackgroundService.adopt")(function* (
 
   if (url.hostname === "0.0.0.0") url.hostname = "127.0.0.1"
 
-  const runningVersion = yield* fs.readFileString(setup.file ?? setup.client.fallback()).pipe(
+  const runningVersion = yield* fs.readFileString(setup.file).pipe(
     Effect.map(
       (text) =>
         Option.getOrUndefined(Schema.decodeUnknownOption(Schema.fromJsonString(RegisteredService))(text))?.version,
