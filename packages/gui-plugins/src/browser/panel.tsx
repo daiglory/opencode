@@ -34,7 +34,10 @@ import {
   type AddressEvent,
 } from "./address-machine"
 import { commentNote, pageNote } from "./comment"
+import { Glyph } from "./choices"
 import { bare, highlight, type Visit } from "./history"
+import { SignInOffer } from "./import-prompt"
+import type definition from "./index"
 import type { Model } from "./model"
 import {
   capturesEscape,
@@ -47,6 +50,7 @@ import {
   type OverlayEvent,
 } from "./overlay-machine"
 import { PageIcon } from "./page-icon"
+import { BrowserProfile } from "./profile/ipc"
 import {
   initialSiteState,
   SITE_CLEAR_TIMEOUT_MS,
@@ -65,7 +69,7 @@ export default function SessionBrowserPane(props: {
   screen: SessionScreen
   model: Model
 }) {
-  const plugin = usePlugin()
+  const plugin = usePlugin<typeof definition>()
   const keybinds = plugin.keybinds
   const desktop = plugin.desktop
   const embeds = plugin.embeds
@@ -77,6 +81,17 @@ export default function SessionBrowserPane(props: {
   const failed = () => !!state()?.loadError
   const suspended = () => props.model.suspended(props.session)
   const command = (action: Browser.Action) => props.model.command(props.session, action)
+  const profile = plugin.use(BrowserProfile)
+  // The pane offers to import sign-ins until the user imports or declines once, and keeps the offer's confirmation of
+  // an import until the user closes it.
+  const [confirming, setConfirming] = createSignal(false)
+  const offering = () => !plugin.stores.preferences.value.welcomed || confirming()
+
+  const extensions = () => {
+    const current = profile()
+
+    return current.status === "active" ? (current.value.state()?.extensions ?? []) : []
+  }
 
   const page = () => {
     const tab = state()
@@ -219,6 +234,15 @@ export default function SessionBrowserPane(props: {
   // Navigates the tab and keeps the address in the field until the page reports where it went. Ends editing here rather
   // than on blur: a click elsewhere, such as a recent page, may have blurred the field already.
   const go = (url: string) => dispatchAddress({ type: "navigated", url, epoch: epoch() })
+
+  // Cookies came in: the offer stays to say so, and the page loads again with them, so a signed-out site opens signed
+  // in.
+  const imported = () => {
+    const tab = state()
+    setConfirming(true)
+
+    if (tab && address()) command({ type: "reload", tabID: tab.id })
+  }
 
   const submitOverlay = (value: string) => dispatchOverlay({ type: "overlay.submitted", value, context: context() })
   const openNote = () => dispatchOverlay({ type: "note.opened", context: context() })
@@ -660,6 +684,44 @@ export default function SessionBrowserPane(props: {
               icon={<Icon name="outline-browser-annotate" />}
             />
           </Tooltip>
+          {/* Extensions load into the profile, where pages of a server on this computer browse. */}
+          <Show when={props.session.server.local && extensions().length > 0}>
+            <Menu gutter={4} modal={false} placement="bottom-end">
+              <Tooltip placement="top" value={plugin.t("extensions.menu")}>
+                <Menu.Trigger
+                  as={IconButton}
+                  variant="ghost-muted"
+                  size="large"
+                  data-action="browser-extensions"
+                  icon={<Icon name="extensions" />}
+                  aria-label={plugin.t("extensions.menu")}
+                />
+              </Tooltip>
+              <Menu.Portal>
+                <Menu.Content class="w-[220px]">
+                  <For each={extensions()}>
+                    {(extension) => (
+                      <Menu.Item
+                        disabled={!extension.enabled || !(extension.popup ?? extension.options)}
+                        onSelect={() => {
+                          const page = extension.popup ?? extension.options
+
+                          if (page) props.model.openURL(props.session, page)
+                        }}
+                      >
+                        <Glyph image={extension.icon} fallback="extensions" class="!size-4" />
+                        <span class="min-w-0 truncate">{extension.name}</span>
+                      </Menu.Item>
+                    )}
+                  </For>
+                  <Menu.Separator />
+                  <Menu.Item onSelect={() => plugin.layout.settings("browser")}>
+                    {plugin.t("extensions.manage")}
+                  </Menu.Item>
+                </Menu.Content>
+              </Menu.Portal>
+            </Menu>
+          </Show>
           <Menu gutter={4} modal={false} placement="bottom-end">
             <Tooltip placement="top" value={plugin.t("options")}>
               <Menu.Trigger
@@ -702,6 +764,9 @@ export default function SessionBrowserPane(props: {
                   {plugin.t("external.menu")}
                 </Menu.Item>
                 <Menu.Separator />
+                <Menu.Item onSelect={() => plugin.layout.settings("browser")}>{plugin.t("signins.menu")}</Menu.Item>
+                <Menu.Item onSelect={() => plugin.layout.settings("browser")}>{plugin.t("extensions.menu")}</Menu.Item>
+                <Menu.Separator />
                 <Menu.Item disabled={props.model.visits().length === 0} onSelect={() => props.model.clearHistory()}>
                   {plugin.t("history.clear")}
                 </Menu.Item>
@@ -719,6 +784,10 @@ export default function SessionBrowserPane(props: {
           {error()}
         </div>
       </Show>
+      {/* Above a page, where a signed-out site is the reason to import; the new tab page shows the offer as a card. */}
+      <Show when={offering() && !empty() && !suspended()}>
+        <SignInOffer variant="bar" imported={imported} closed={() => setConfirming(false)} />
+      </Show>
       <embeds.View
         id={embed()}
         visible={shown()}
@@ -731,6 +800,9 @@ export default function SessionBrowserPane(props: {
         <div ref={box} aria-hidden="true" class="pointer-events-none absolute inset-0" />
         <Show when={empty() && !failed() && !suspended()}>
           <div dir="auto" class="size-full overflow-y-auto">
+            <Show when={offering()}>
+              <SignInOffer variant="card" imported={imported} closed={() => setConfirming(false)} />
+            </Show>
             <Show
               when={recent().length > 0}
               fallback={
