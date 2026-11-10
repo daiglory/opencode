@@ -2555,6 +2555,7 @@ export type ConfigEntry =
           shell_timeout_background?: boolean
           console_watches?: boolean
           part_rows?: boolean
+          sqlite_fts?: boolean
           image_generate?: boolean | { model?: string | { providerID: string; model: string; variant?: string } }
           subagent_depth?: number
           location_idle_timeout?: string | false
