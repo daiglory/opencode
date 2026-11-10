@@ -25273,9 +25273,12 @@
               },
               "usageURL": {
                 "type": "string"
+              },
+              "goURL": {
+                "type": "string"
               }
             },
-            "required": ["id", "usageURL"],
+            "required": ["id", "usageURL", "goURL"],
             "additionalProperties": false
           },
           "go": {
