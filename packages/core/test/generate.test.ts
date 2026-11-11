@@ -21,6 +21,7 @@ import { Integration } from "@opencode/core/integration"
 import { IntegrationConnection } from "@opencode/core/integration/connection"
 import { ModelResolver } from "@opencode/core/model-resolver"
 import { ModelsDev } from "@opencode/core/models-dev"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { ID, Info, Model, Ref, VariantID } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { Variant } from "@opencode/core/variant"
@@ -82,7 +83,8 @@ const aisdk = Layer.mock(AISDK.Service, {
 const client = TestLLM.testLayer({ fallback: TestLLM.text("OK", "generate") })
 
 const resolver = ModelResolver.layer.pipe(Layer.provide(Layer.mergeAll(providers, models, integrations, npm, aisdk)))
-const generateDeps = Layer.mergeAll(models, RequestExecutor.fetchLayer)
+const hooks = Layer.mock(PluginHooks.Service, { has: () => Effect.succeed(false) })
+const generateDeps = Layer.mergeAll(models, hooks, RequestExecutor.fetchLayer)
 const it = testEffect(Generate.layer.pipe(Layer.provide(Layer.mergeAll(resolver, client, generateDeps))))
 const resolverIt = testEffect(resolver)
 const retryIt = testEffect(
@@ -268,7 +270,9 @@ testEffect(Layer.empty).effect("attributes each stateless completion without cre
           }),
         ).toBe("OK")
       }
-    }).pipe(Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(resolver, native, models, executor)))))
+    }).pipe(
+      Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(resolver, native, models, hooks, executor)))),
+    )
     expect(sessions).toHaveLength(2)
     expect(sessions[0]).toStartWith("ses_")
     expect(sessions[1]).not.toBe(sessions[0])
@@ -420,7 +424,7 @@ describe("image and decision generation", () => {
     Layer.provide(Layer.mergeAll(mediaProviders, mediaModels, mediaIntegrations, npm, aisdk)),
   )
   const mediaIt = testEffect(
-    Generate.layer.pipe(Layer.provide(Layer.mergeAll(mediaResolver, client, mediaModels, executor))),
+    Generate.layer.pipe(Layer.provide(Layer.mergeAll(mediaResolver, client, mediaModels, hooks, executor))),
   )
   const ref = (providerID: string, id: string, variant?: string) =>
     Ref.make({
@@ -588,6 +592,51 @@ describe("image and decision generation", () => {
         .decisions({ model: ref("openrouter", "typesafe/jev-1.13"), input: [], questions: [question, question] })
         .pipe(Effect.flip)
       expect(error._tag).toBe("Generate.InvalidRequestError")
+    }),
+  )
+
+  // Records each model HTTP hook call and tags the request, so the provider sees which calls were hooked.
+  const hooked: string[] = []
+  const recording = Layer.mock(PluginHooks.Service, {
+    has: () => Effect.succeed(true),
+    trigger: (_domain, name, event) =>
+      Effect.sync(() => {
+        record(String(name), event)
+        return event
+      }),
+  })
+  const record = (name: string, event: unknown) => {
+    if (!(event instanceof Object) || !("kind" in event)) return
+    hooked.push(`${name}:${String(event.kind)}`)
+    if (name === "experimental.http.request" && "request" in event && event.request instanceof Request)
+      event.request.headers.set("x-hook", "1")
+  }
+  const hookedIt = testEffect(
+    Generate.layer.pipe(Layer.provide(Layer.mergeAll(mediaResolver, client, mediaModels, recording, executor))),
+  )
+
+  hookedIt.effect("runs model HTTP hooks on image and decision provider requests, but not image downloads", () =>
+    Effect.gen(function* () {
+      requests.length = 0
+      hooked.length = 0
+      const generate = yield* Generate.Service
+      yield* generate.image({ model: ref("zai", "glm-image"), prompt: "A fox" })
+      yield* generate.decisions({
+        model: ref("decide-host", "decide-default"),
+        input: [{ type: "text", text: "Is this a photo?" }],
+        questions: [{ type: "predicate", name: "photo", instructions: "Is this a photo?" }],
+      })
+      expect(hooked).toEqual([
+        "experimental.http.request:image",
+        "experimental.http.response:image",
+        "experimental.http.request:decision",
+        "experimental.http.response:decision",
+      ])
+      expect(requests.map((request) => [request.url, request.headers["x-hook"] ?? "-"])).toEqual([
+        ["https://api.z.ai/api/paas/v4/images/generations", "1"],
+        ["https://images.example/fox", "-"],
+        ["https://api.typesafe.ai/v1/systemone", "1"],
+      ])
     }),
   )
 
